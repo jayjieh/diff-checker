@@ -3,6 +3,8 @@ import os
 import re
 import json
 import difflib
+import sys
+import datetime
 import xml.etree.ElementTree as ET
 from typing import List, Dict, Any, Optional
 from collections import Counter
@@ -28,6 +30,18 @@ MANUAL_MODULE_MAP = {
 PACKAGE_MAP = {
     "com.quarkus.project": "com.springboot.project"
 }
+
+
+def log_startup():
+    print("")
+    print("=" * 80)
+    print(f"[MCP] Starting MCP Server: repo-diff-enhanced")
+    print(f"[MCP] Timestamp:  {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"[MCP] Python:     {sys.version.split()[0]}")
+    print(f"[MCP] File:       {os.path.abspath(__file__)}")
+    print(f"[MCP] CWD:        {os.getcwd()}")
+    print("=" * 80)
+    print("")
 
 
 # ====================================================================================
@@ -955,4 +969,5 @@ def write_to_readme(
 # ====================================================================================
 
 if __name__ == "__main__":
+    log_startup()
     mcp.run()
