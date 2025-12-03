@@ -964,6 +964,126 @@ def write_to_readme(
     }
 
 
+@mcp.tool(title="List Java file names matching multiple regex patterns")
+def list_files_matching_multi(
+    root_path: str,
+    patterns: List[str],
+    match_mode: str = "any",   # "any" or "all"
+    include_dirs: bool = False,
+    ignore_case: bool = True,
+    group_results: bool = False
+) -> Dict[str, Any]:
+    """
+    Recursively list Java *file names only* that match multiple regex patterns.
+    Does not return directory structure like src/main/java/... — only the final filename.
+
+    Args:
+        root_path (str): Folder or repo root to search.
+        patterns (List[str]): Regex patterns for matching filenames or paths.
+        match_mode (str): "any" = match one pattern, "all" = must match all patterns.
+        include_dirs (bool): If true, directories can be matched too.
+        ignore_case (bool): Case-insensitive regex.
+        group_results (bool): If true, group results per pattern.
+
+    Returns:
+        {
+            "root": "...",
+            "patterns": [...],
+            "matched": N,
+            "results": [
+                {"file_name": "...", "absolute": "..."}
+            ],
+            "groups": { ... } or {}
+        }
+    """
+    if not os.path.isdir(root_path):
+        raise ValueError(f"root_path is not a directory: {root_path}")
+
+    flags = re.IGNORECASE if ignore_case else 0
+    regex_list = [(pat, re.compile(pat, flags)) for pat in patterns]
+
+    root = os.path.abspath(root_path)
+    results = []
+    grouped = {pat: [] for pat in patterns}
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        # remove unwanted dirs
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in (".git", "target", "build", ".idea", ".vscode", "out")
+        ]
+
+        # -------------------------
+        # Match Java files
+        # -------------------------
+        for fname in filenames:
+            if not fname.endswith(".java"):
+                continue
+
+            abs_path = os.path.join(dirpath, fname)
+
+            # we match regex against the *full relative path* for flexibility
+            rel_full = os.path.relpath(abs_path, root).replace("\\", "/")
+
+            matches = []
+            for pat, regex in regex_list:
+                if regex.search(rel_full) or regex.search(fname):
+                    matches.append(pat)
+
+            # any vs all
+            if (match_mode == "any" and matches) or \
+               (match_mode == "all" and len(matches) == len(patterns)):
+
+                results.append({
+                    "file_name": fname,
+                    "absolute": abs_path
+                })
+
+                if group_results:
+                    for m in matches:
+                        grouped[m].append({
+                            "file_name": fname,
+                            "absolute": abs_path
+                        })
+
+        # -------------------------
+        # Optionally match directories
+        # -------------------------
+        if include_dirs:
+            for d in dirnames:
+                abs_path = os.path.join(dirpath, d)
+                rel_full = os.path.relpath(abs_path, root).replace("\\", "/")
+
+                matches = []
+                for pat, regex in regex_list:
+                    if regex.search(rel_full) or regex.search(d):
+                        matches.append(pat)
+
+                if (match_mode == "any" and matches) or \
+                   (match_mode == "all" and len(matches) == len(patterns)):
+
+                    results.append({
+                        "file_name": d,
+                        "absolute": abs_path
+                    })
+
+                    if group_results:
+                        for m in matches:
+                            grouped[m].append({
+                                "file_name": d,
+                                "absolute": abs_path
+                            })
+
+    return {
+        "root": root,
+        "patterns": patterns,
+        "match_mode": match_mode,
+        "matched": len(results),
+        "results": results[:5000],
+        "groups": grouped if group_results else {}
+    }
+
+
 # ====================================================================================
 # Run MCP server
 # ====================================================================================
