@@ -25,7 +25,11 @@ Core tools:
 - `detect_module_similarity`
 - `scan_repos`
 - `get_file_diff`
-- `scan_quarkus_modules_vs_spring_projects`
+  - `list_changed_files_since_commit`
+  - `get_diff_since_commit`
+  - `merge_changes_tool`
+  - `clear_backup`
+  - `scan_quarkus_modules_vs_spring_projects`
 - `analyze_api_differences`
 - `write_to_readme`
 
@@ -161,7 +165,27 @@ This compares all Java files between two repos using module & package normalizat
 
 ---
 
-## 9. Single File Diff (`get_file_diff`) → README
+## 9. Changed Since Commit + Diff (`scan_repos`) → README
+
+Use this when you want to limit the comparison to files changed since a specific commit
+in the left repo, then compare those files against the right repo.
+
+**Prompt:**
+
+> Call `scan_repos` with:  
+> `left_repo_path = "C:/tmp/quarkus-project"`  
+> `right_repo_path = "C:/tmp/spring-project"`  
+> `left_commit = "abc1234"`  
+> `include_staged = true`  
+> `include_untracked = true`.  
+> Create a markdown section `## Repo Diff Summary (Changed Since abc1234)` containing:  
+> - total counts for `only_in_left`, `only_in_right`, `different_files`, `identical`, `total_common`,  
+> - and a table of the first 20 `different_files` with columns `File | Status` where Status is `different`.  
+> Append this section to `C:/tmp/diff-report/README.md` using `write_to_readme`.
+
+---
+
+## 10. Single File Diff (`get_file_diff`) → README
 
 After `scan_repos`, pick one normalized key from `different_files`  
 (e.g. `src/main/java/core/JobIdConverter.java`).
@@ -180,11 +204,11 @@ After `scan_repos`, pick one normalized key from `different_files`
 
 ---
 
-## 10. Quarkus Modules vs Spring Projects → README
+## 11. Quarkus Modules vs Spring Projects → README
 
 Use this when the **Quarkus repo is multi-module** and the **Spring side is split into separate repos**.
 
-### 10.1 Module-to-project comparison summary
+### 11.1 Module-to-project comparison summary
 
 **Prompt:**
 
@@ -204,7 +228,7 @@ Use this when the **Quarkus repo is multi-module** and the **Spring side is spli
 > - `identical` and `total_common`.  
 > Append all module sections to `C:/tmp/diff-report/README.md` using `write_to_readme`.
 
-### 10.2 Per-module READMEs (optional)
+### 11.2 Per-module READMEs (optional)
 
 **Prompt:**
 
@@ -216,9 +240,9 @@ Use this when the **Quarkus repo is multi-module** and the **Spring side is spli
 
 ---
 
-## 11. API Differences (Quarkus REST vs Spring OpenAPI) → README
+## 12. API Differences (Quarkus REST vs Spring OpenAPI) → README
 
-### 11.1 If you know the OpenAPI spec path
+### 12.1 If you know the OpenAPI spec path
 
 **Prompt:**
 
@@ -233,7 +257,7 @@ Use this when the **Quarkus repo is multi-module** and the **Spring side is spli
 > - and list the first 10 entries from each of `only_in_quarkus` and `only_in_openapi` (showing method + path).  
 > Append this section to `C:/tmp/diff-report/README.md` using `write_to_readme`.
 
-### 11.2 Auto-discover OpenAPI specs
+### 12.2 Auto-discover OpenAPI specs
 
 **Prompt:**
 
@@ -246,7 +270,39 @@ Use this when the **Quarkus repo is multi-module** and the **Spring side is spli
 
 ---
 
-## 12. General Pattern for New Reports
+## 13. Changes Since Commit -> README
+
+Use these when you need to compare a specific Git commit against current files.
+
+### 13.1 List changed files since a commit
+
+**Prompt:**
+
+> Call `list_changed_files_since_commit` with:  
+> `repo_path = "C:/tmp/quarkus-project"`  
+> `commit = "abc1234"`  
+> `include_staged = true`  
+> `include_untracked = false`.  
+> Create a markdown section `## Files Changed Since abc1234` listing the total `count`  
+> and the first 20 entries from `changed_files`.  
+> Append the section to `C:/tmp/diff-report/README.md` using `write_to_readme`.
+
+### 13.2 Diff a specific file since a commit
+
+**Prompt:**
+
+> Call `get_diff_since_commit` with:  
+> `repo_path = "C:/tmp/quarkus-project"`  
+> `commit = "abc1234"`  
+> `relative_path = "src/main/java/core/JobIdConverter.java"`  
+> `context_lines = 4`.  
+> Wrap the `diff` field in a fenced ```diff``` block under  
+> `## Diff Since abc1234: JobIdConverter.java`  
+> and append it to `C:/tmp/diff-report/README.md` using `write_to_readme`.
+
+---
+
+## 14. General Pattern for New Reports
 
 Whenever you run any MCP tool and want the result saved:
 
@@ -270,7 +326,53 @@ Whenever you run any MCP tool and want the result saved:
 
 ---
 
-## 13. Notes
+
+## 15. Merge Changes → README
+
+Use this to preview and apply changes from a source repo into a target repo.
+
+### 15.1 Preview changes
+
+**Prompt:**
+
+> Call `merge_changes_tool` with:  
+> `source_repo_path = "C:/tmp/quarkus-project"`  
+> `target_repo_path = "C:/tmp/spring-project"`  
+> `source_commit = "abc1234"`  
+> `mode = "preview"`  
+> `include_staged = true`  
+> `include_untracked = true`.  
+> Create a markdown section `## Preview Merge (Since abc1234)` listing the total `changed_files_count`  
+> and a table of the first 30 `preview` entries with columns `Path | Target Exists`.  
+> Append this section to `C:/tmp/diff-report/README.md` using `write_to_readme`.
+
+### 15.2 Apply approved changes
+
+**Prompt:**
+
+> Call `merge_changes_tool` with:  
+> `source_repo_path = "C:/tmp/quarkus-project"`  
+> `target_repo_path = "C:/tmp/spring-project"`  
+> `source_commit = "abc1234"`  
+> `mode = "apply"`  
+> `allow_files = ["src/main/java/core/JobIdConverter.java", "src/main/resources/app.yml"]`  
+> `include_staged = true`  
+> `include_untracked = true`.  
+> Create a markdown section `## Merge Apply Results (Since abc1234)` summarizing counts of `applied`, `failed`, and `skipped`,  
+> and list failed entries with their `error` and `backup` path.  
+> Append it to `C:/tmp/diff-report/README.md` using `write_to_readme`.
+
+### 15.3 Clear backups
+
+**Prompt:**
+
+> Call `clear_backup` with:  
+> `repo_path = "C:/tmp/spring-project"`  
+> `dry_run = true`.  
+> If the list looks safe, call `clear_backup` again with `dry_run = false`.
+
+---
+## 16. Notes
 
 - Paths like `C:/tmp/...` should be adjusted to your actual repo locations.
 - `MANUAL_MODULE_MAP` and `PACKAGE_MAP` are currently defined in Python, but you can extend the server later to pass them as parameters if needed.

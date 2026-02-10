@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+﻿#!/usr/bin/env python
 import os
 import re
 import json
@@ -6,6 +6,8 @@ import difflib
 import sys
 import datetime
 import xml.etree.ElementTree as ET
+import subprocess
+import shutil
 from typing import List, Dict, Any, Optional
 from collections import Counter
 
@@ -17,7 +19,7 @@ mcp = FastMCP("repo-diff-enhanced")
 # CONFIG: MODULE AND PACKAGE MAPPING (manual overrides)
 # ====================================================================================
 
-# Manual module mapping hints – Quarkus multimodule -> Spring standalone projects
+# Manual module mapping hints - Quarkus multimodule -> Spring standalone projects
 MANUAL_MODULE_MAP = {
     "demo-module-api-1": "demo-module-api-1",
     "demo-module-api-2": "demo-module-api-2",
@@ -63,6 +65,77 @@ def _read_file_text(path: str) -> str:
             continue
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         return f.read()
+
+
+def _git(repo_root: str, args: List[str]) -> str:
+    completed = subprocess.run(
+        ["git", "-C", repo_root] + args,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    return completed.stdout
+
+
+def _git_diff(repo_root: str, args: List[str]) -> str:
+    completed = subprocess.run(
+        ["git", "-C", repo_root] + args,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if completed.returncode not in (0, 1):
+        err = (completed.stderr or "").strip()
+        raise ValueError(f"git diff failed in {repo_root}" + (f": {err}" if err else ""))
+    return completed.stdout
+
+
+def _validate_repo_path(path: str, must_be_git: bool = True) -> str:
+    root = os.path.abspath(path)
+    if not os.path.isdir(root):
+        raise ValueError(f"Repo path is not a directory: {root}")
+    if must_be_git:
+        try:
+            _git(root, ["rev-parse", "--show-toplevel"])
+        except subprocess.CalledProcessError as e:
+            msg = (e.stderr or "").strip()
+            raise ValueError(
+                f"Repo path is not a git repo or is inaccessible: {root}"
+                + (f" ({msg})" if msg else "")
+            )
+    return root
+
+
+def _collect_changed_files(
+    repo_root: str,
+    commit: str,
+    include_staged: bool = True,
+    include_untracked: bool = False,
+) -> Dict[str, Any]:
+    changed = set()
+
+    for line in _git_diff(repo_root, ["diff", "--name-only", commit]).splitlines():
+        if line:
+            changed.add(_normalize_path(line.strip()))
+
+    if include_staged:
+        for line in _git_diff(repo_root, ["diff", "--name-only", "--cached", commit]).splitlines():
+            if line:
+                changed.add(_normalize_path(line.strip()))
+
+    untracked = set()
+    if include_untracked:
+        for line in _git(repo_root, ["ls-files", "--others", "--exclude-standard"]).splitlines():
+            if line:
+                untracked.add(_normalize_path(line.strip()))
+        changed |= untracked
+
+    return {
+        "changed_files": sorted(changed),
+        "untracked_files": sorted(untracked),
+    }
 
 
 def _collect_java_files(root: str, exclude_dirs=None) -> Dict[str, str]:
@@ -140,7 +213,7 @@ def _parse_pom(pom_path: str) -> Dict[str, Any]:
 
         def find_text(tag: str) -> Optional[str]:
             """
-            Find direct child text under project, and fallback to parent/groupId/… if needed.
+            Find direct child text under project, and fallback to parent/groupId/... if needed.
             """
             el = root.find(f"{ns}{tag}")
             if el is not None and el.text:
@@ -361,9 +434,8 @@ def _detect_package_roots_internal(repo_root: str, max_files: int = 5000) -> Dic
 
 @mcp.tool(title="Detect dominant package roots in a repo")
 def detect_package_roots(repo_path: str, max_files: int = 5000) -> Dict[str, Any]:
-    if not os.path.isdir(repo_path):
-        raise ValueError(f"Repo path is not a directory: {repo_path}")
-    return _detect_package_roots_internal(repo_path, max_files=max_files)
+    root = _validate_repo_path(repo_path)
+    return _detect_package_roots_internal(root, max_files=max_files)
 
 
 # ====================================================================================
@@ -420,13 +492,8 @@ def detect_module_similarity(
     top_n: int = 3,
     min_score: float = 0.1,
 ) -> Dict[str, Any]:
-    root_a = os.path.abspath(repo_a_path)
-    root_b = os.path.abspath(repo_b_path)
-
-    if not os.path.isdir(root_a):
-        raise ValueError(f"repo_a_path is not a directory: {root_a}")
-    if not os.path.isdir(root_b):
-        raise ValueError(f"repo_b_path is not a directory: {root_b}")
+    root_a = _validate_repo_path(repo_a_path)
+    root_b = _validate_repo_path(repo_b_path)
 
     modules_a = _discover_modules_for_similarity(root_a)
     modules_b = _discover_modules_for_similarity(root_b)
@@ -651,10 +718,8 @@ def analyze_api_differences(
     spring_repo_path: str,
     spring_openapi_relative_paths: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    if not os.path.isdir(quarkus_repo_path):
-        raise ValueError(f"quarkus_repo_path is not a directory: {quarkus_repo_path}")
-    if not os.path.isdir(spring_repo_path):
-        raise ValueError(f"spring_repo_path is not a directory: {spring_repo_path}")
+    quarkus_repo_path = _validate_repo_path(quarkus_repo_path)
+    spring_repo_path = _validate_repo_path(spring_repo_path)
 
     quarkus_info = _collect_quarkus_endpoints(quarkus_repo_path)
     openapi_info = _collect_openapi_operations(spring_repo_path, spec_relative_paths=spring_openapi_relative_paths)
@@ -702,17 +767,14 @@ def analyze_api_differences(
 
 @mcp.tool(title="Analyze a Java repo (framework & multimodule detection)")
 def analyze_repo(repo_path: str) -> Dict[str, Any]:
-    if not os.path.isdir(repo_path):
-        raise ValueError(f"Repo path is not a directory: {repo_path}")
-    return _analyze_repo_internal(repo_path)
+    root = _validate_repo_path(repo_path)
+    return _analyze_repo_internal(root)
 
 
 @mcp.tool(title="Classify two repos as Quarkus vs Spring and multimodule")
 def classify_two_repos(repo_a_path: str, repo_b_path: str) -> Dict[str, Any]:
-    if not os.path.isdir(repo_a_path):
-        raise ValueError(f"repo_a_path is not a directory: {repo_a_path}")
-    if not os.path.isdir(repo_b_path):
-        raise ValueError(f"repo_b_path is not a directory: {repo_b_path}")
+    repo_a_path = _validate_repo_path(repo_a_path)
+    repo_b_path = _validate_repo_path(repo_b_path)
 
     a_info = _analyze_repo_internal(repo_a_path)
     b_info = _analyze_repo_internal(repo_b_path)
@@ -744,14 +806,15 @@ def classify_two_repos(repo_a_path: str, repo_b_path: str) -> Dict[str, Any]:
 
 
 @mcp.tool(title="Compare two Java repos using module and package mapping")
-def scan_repos(left_repo_path: str, right_repo_path: str) -> Dict[str, Any]:
-    left_root = os.path.abspath(left_repo_path)
-    right_root = os.path.abspath(right_repo_path)
-
-    if not os.path.isdir(left_root):
-        raise ValueError(f"Left repo path is not a directory: {left_root}")
-    if not os.path.isdir(right_root):
-        raise ValueError(f"Right repo path is not a directory: {right_root}")
+def scan_repos(
+    left_repo_path: str,
+    right_repo_path: str,
+    left_commit: Optional[str] = None,
+    include_staged: bool = True,
+    include_untracked: bool = False,
+) -> Dict[str, Any]:
+    left_root = _validate_repo_path(left_repo_path)
+    right_root = _validate_repo_path(right_repo_path)
 
     left_files = _collect_java_files(left_root)
     right_files = _collect_java_files(right_root)
@@ -761,6 +824,22 @@ def scan_repos(left_repo_path: str, right_repo_path: str) -> Dict[str, Any]:
 
     left_keys = set(left_norm.keys())
     right_keys = set(right_norm.keys())
+
+    filtered_changed = None
+    if left_commit:
+        changed = set()
+        result = _collect_changed_files(
+            left_root,
+            left_commit,
+            include_staged=include_staged,
+            include_untracked=include_untracked,
+        )
+        for rel in result["changed_files"]:
+            if not rel.endswith(".java"):
+                continue
+            changed.add(normalize_java_relpath(rel))
+        filtered_changed = sorted(changed)
+        left_keys = left_keys & changed
 
     only_left = sorted(left_keys - right_keys)
     only_right = sorted(right_keys - left_keys)
@@ -784,6 +863,10 @@ def scan_repos(left_repo_path: str, right_repo_path: str) -> Dict[str, Any]:
     return {
         "left_root": left_root,
         "right_root": right_root,
+        "left_commit": left_commit,
+        "include_staged": include_staged,
+        "include_untracked": include_untracked,
+        "filtered_changed_files": filtered_changed,
         "only_in_left": only_left,
         "only_in_right": only_right,
         "different_files": different,
@@ -799,8 +882,8 @@ def get_file_diff(
     relative_path: str,
     context_lines: int = 4,
 ) -> Dict[str, str]:
-    left_root = os.path.abspath(left_repo_path)
-    right_root = os.path.abspath(right_repo_path)
+    left_root = _validate_repo_path(left_repo_path)
+    right_root = _validate_repo_path(right_repo_path)
     norm_key = relative_path
 
     def find_actual(repo_root: str, key: str) -> Optional[str]:
@@ -848,9 +931,7 @@ def scan_quarkus_modules_vs_spring_projects(
     quarkus_repo_path: str,
     module_mappings: List[Dict[str, str]],
 ) -> Dict[str, Any]:
-    quarkus_root = os.path.abspath(quarkus_repo_path)
-    if not os.path.isdir(quarkus_root):
-        raise ValueError(f"quarkus_repo_path is not a directory: {quarkus_root}")
+    quarkus_root = _validate_repo_path(quarkus_repo_path)
 
     results = []
 
@@ -867,21 +948,13 @@ def scan_quarkus_modules_vs_spring_projects(
             continue
 
         quarkus_module_root = os.path.join(quarkus_root, module_name)
-        spring_root = os.path.abspath(spring_repo)
+        spring_root = _validate_repo_path(spring_repo)
 
         if not os.path.isdir(quarkus_module_root):
             results.append({
                 "module": module_name,
                 "spring_repo_path": spring_root,
                 "error": f"Quarkus module directory does not exist: {quarkus_module_root}",
-            })
-            continue
-
-        if not os.path.isdir(spring_root):
-            results.append({
-                "module": module_name,
-                "spring_repo_path": spring_root,
-                "error": f"Spring repo directory does not exist: {spring_root}",
             })
             continue
 
@@ -975,7 +1048,7 @@ def list_files_matching_multi(
 ) -> Dict[str, Any]:
     """
     Recursively list Java *file names only* that match multiple regex patterns.
-    Does not return directory structure like src/main/java/... — only the final filename.
+    Does not return directory structure like src/main/java/... - only the final filename.
 
     Args:
         root_path (str): Folder or repo root to search.
@@ -1081,6 +1154,217 @@ def list_files_matching_multi(
         "matched": len(results),
         "results": results[:5000],
         "groups": grouped if group_results else {}
+    }
+
+
+@mcp.tool(title="Merge changes from source repo into target repo")
+def merge_changes_tool(
+    source_repo_path: str,
+    target_repo_path: str,
+    source_commit: str,
+    mode: str = "preview",  # "preview" or "apply"
+    allow_files: Optional[List[str]] = None,
+    include_staged: bool = True,
+    include_untracked: bool = False,
+    context_lines: int = 3,
+) -> Dict[str, Any]:
+    source_root = _validate_repo_path(source_repo_path)
+    target_root = _validate_repo_path(target_repo_path)
+
+    if mode not in ("preview", "apply"):
+        raise ValueError("mode must be 'preview' or 'apply'")
+
+    changed_info = _collect_changed_files(
+        source_root,
+        source_commit,
+        include_staged=include_staged,
+        include_untracked=include_untracked,
+    )
+    changed_files = changed_info["changed_files"]
+    untracked_set = set(changed_info["untracked_files"])
+
+    preview_items = []
+    for rel in changed_files:
+        target_abs = os.path.join(target_root, rel)
+        preview_items.append({
+            "path": rel,
+            "target_exists": os.path.isfile(target_abs),
+        })
+
+    if mode == "preview":
+        return {
+            "source_root": source_root,
+            "target_root": target_root,
+            "source_commit": source_commit,
+            "include_staged": include_staged,
+            "include_untracked": include_untracked,
+            "changed_files_count": len(changed_files),
+            "changed_files": changed_files,
+            "preview": preview_items,
+        }
+
+    if not allow_files:
+        raise ValueError("allow_files must be provided when mode='apply'")
+
+    allow_set = set(_normalize_path(p) for p in allow_files)
+    results = []
+
+    for rel in allow_set:
+        if rel not in changed_files:
+            results.append({
+                "path": rel,
+                "status": "skipped",
+                "reason": "not in changed_files",
+            })
+            continue
+
+        patch_parts = []
+
+        # Untracked files: use no-index diff against /dev/null
+        if rel in untracked_set:
+            patch = _git_diff(
+                source_root,
+                ["diff", "--no-prefix", "--binary", "--no-index", "--", "/dev/null", rel],
+            )
+            if patch:
+                patch_parts.append(patch)
+
+        # Tracked files: diff against commit (unstaged)
+        patch = _git_diff(
+            source_root,
+            ["diff", "--no-prefix", "--binary", f"-U{context_lines}", source_commit, "--", rel],
+        )
+        if patch:
+            patch_parts.append(patch)
+
+        # Staged changes
+        if include_staged:
+            patch = _git_diff(
+                source_root,
+                ["diff", "--no-prefix", "--binary", f"-U{context_lines}", "--cached", source_commit, "--", rel],
+            )
+            if patch:
+                patch_parts.append(patch)
+
+        patch_text = "".join(patch_parts)
+        if not patch_text.strip():
+            results.append({
+                "path": rel,
+                "status": "skipped",
+                "reason": "no diff for file",
+            })
+            continue
+
+        target_abs = os.path.join(target_root, rel)
+        backup_path = None
+        if os.path.isfile(target_abs):
+            backup_path = target_abs + ".bak"
+            os.makedirs(os.path.dirname(backup_path), exist_ok=True)
+            shutil.copy2(target_abs, backup_path)
+
+        apply_proc = subprocess.run(
+            ["git", "-C", target_root, "apply", "--binary", "--whitespace=nowarn"],
+            input=patch_text,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        if apply_proc.returncode == 0:
+            if backup_path and os.path.isfile(backup_path):
+                os.remove(backup_path)
+            results.append({
+                "path": rel,
+                "status": "applied",
+            })
+        else:
+            results.append({
+                "path": rel,
+                "status": "failed",
+                "error": (apply_proc.stderr or "").strip(),
+                "backup": backup_path,
+            })
+
+    return {
+        "source_root": source_root,
+        "target_root": target_root,
+        "source_commit": source_commit,
+        "include_staged": include_staged,
+        "include_untracked": include_untracked,
+        "mode": mode,
+        "results": results,
+    }
+
+
+@mcp.tool(title="Clear .bak backups in a repo")
+def clear_backup(
+    repo_path: str,
+    dry_run: bool = True,
+) -> Dict[str, Any]:
+    root = _validate_repo_path(repo_path)
+    removed = []
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in (".git", "target", "build", ".idea", ".vscode", "out")]
+        for fname in filenames:
+            if not fname.endswith(".bak"):
+                continue
+            abs_path = os.path.join(dirpath, fname)
+            removed.append(abs_path)
+            if not dry_run:
+                os.remove(abs_path)
+
+    return {
+        "repo_root": root,
+        "dry_run": dry_run,
+        "count": len(removed),
+        "files": removed,
+    }
+@mcp.tool(title="List changed files since a commit")
+def list_changed_files_since_commit(
+    repo_path: str,
+    commit: str,
+    include_untracked: bool = False,
+    include_staged: bool = True,
+) -> Dict[str, Any]:
+    root = _validate_repo_path(repo_path)
+    result = _collect_changed_files(
+        root,
+        commit,
+        include_staged=include_staged,
+        include_untracked=include_untracked,
+    )
+    files = result["changed_files"]
+
+    return {
+        "repo_root": root,
+        "commit": commit,
+        "include_staged": include_staged,
+        "include_untracked": include_untracked,
+        "changed_files": files,
+        "untracked_files": result["untracked_files"],
+        "count": len(files),
+    }
+
+
+@mcp.tool(title="Get diff for a file since a commit")
+def get_diff_since_commit(
+    repo_path: str,
+    commit: str,
+    relative_path: str,
+    context_lines: int = 4,
+) -> Dict[str, Any]:
+    root = _validate_repo_path(repo_path)
+
+    diff = _git_diff(root, ["diff", f"-U{context_lines}", commit, "--", relative_path])
+    if not diff:
+        diff = "(no diff)"
+
+    return {
+        "repo_root": root,
+        "commit": commit,
+        "relative_path": relative_path,
+        "diff": diff,
     }
 
 
