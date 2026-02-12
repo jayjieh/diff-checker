@@ -399,6 +399,34 @@ def _patch_line_stats(patch_text: str) -> Dict[str, int]:
     return {"added": added, "removed": removed}
 
 
+def _filter_paths_by_prefixes(
+    paths: List[str],
+    include_prefixes: Optional[List[str]] = None,
+    exclude_prefixes: Optional[List[str]] = None,
+) -> List[str]:
+    if not include_prefixes and not exclude_prefixes:
+        return paths
+
+    def norm_prefix(p: str) -> str:
+        p = _normalize_path(p)
+        if p and not p.endswith("/"):
+            p += "/"
+        return p
+
+    include_norm = [norm_prefix(p) for p in (include_prefixes or []) if p]
+    exclude_norm = [norm_prefix(p) for p in (exclude_prefixes or []) if p]
+
+    filtered = []
+    for path in paths:
+        p = _normalize_path(path)
+        if include_norm and not any(p.startswith(pref) for pref in include_norm):
+            continue
+        if exclude_norm and any(p.startswith(pref) for pref in exclude_norm):
+            continue
+        filtered.append(path)
+    return filtered
+
+
 # ====================================================================================
 # Repo analysis helpers
 # ====================================================================================
@@ -1943,6 +1971,8 @@ def list_changed_files_since_commit(
     commit: str,
     include_untracked: bool = False,
     include_staged: bool = True,
+    include_prefixes: Optional[List[str]] = None,
+    exclude_prefixes: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     root = _validate_repo_path(repo_path)
     result = _collect_changed_files(
@@ -1951,15 +1981,26 @@ def list_changed_files_since_commit(
         include_staged=include_staged,
         include_untracked=include_untracked,
     )
-    files = result["changed_files"]
+    files = _filter_paths_by_prefixes(
+        result["changed_files"],
+        include_prefixes=include_prefixes,
+        exclude_prefixes=exclude_prefixes,
+    )
+    untracked = _filter_paths_by_prefixes(
+        result["untracked_files"],
+        include_prefixes=include_prefixes,
+        exclude_prefixes=exclude_prefixes,
+    )
 
     return {
         "repo_root": root,
         "commit": commit,
         "include_staged": include_staged,
         "include_untracked": include_untracked,
+        "include_prefixes": include_prefixes or [],
+        "exclude_prefixes": exclude_prefixes or [],
         "changed_files": files,
-        "untracked_files": result["untracked_files"],
+        "untracked_files": untracked,
         "count": len(files),
     }
 

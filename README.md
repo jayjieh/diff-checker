@@ -285,7 +285,9 @@ Use these when you need to compare a specific Git commit against current files.
 > `repo_path = "C:/tmp/quarkus-project"`  
 > `commit = "abc1234"`  
 > `include_staged = true`  
-> `include_untracked = false`.  
+> `include_untracked = false`  
+> `include_prefixes = ["demo-module-api-1/"]`  
+> `exclude_prefixes = ["demo-module-api-2/", "demo-module-api-3/"]`.  
 > Create a markdown section `## Files Changed Since abc1234` listing the total `count`  
 > and the first 20 entries from `changed_files`.  
 > Append the section to `C:/tmp/diff-report/README.md` using `write_to_readme`.
