@@ -453,7 +453,44 @@ Use this to generate a full migration plan across classification, module similar
 > Append this section to `C:/tmp/diff-report/README.md` using `write_to_readme`.
 
 ---
-## 18. Notes
+
+## 18. Merge Prompt Templates (from `generate_migration_plan`) -> README
+
+Use the `merge_prompt_templates` returned by `generate_migration_plan` to drive actual migration steps.
+
+### 18.1 Single file (check)
+
+**Prompt:**
+
+> Use `merge_prompt_templates.single_file_check.prompt` as-is.
+
+### 18.2 Single file (apply)
+
+**Prompt:**
+
+> Use `merge_prompt_templates.single_file_apply.prompt` as-is.
+
+### 18.3 List of files (check)
+
+**Prompt:**
+
+> Use `merge_prompt_templates.list_check.prompt` as-is.
+
+### 18.4 List of files (apply)
+
+**Prompt:**
+
+> Use `merge_prompt_templates.list_apply.prompt` as-is.
+
+### 18.5 Package (prefix) check/apply
+
+**Prompt:**
+
+> Use `merge_prompt_templates.package_check.prompt` or `merge_prompt_templates.package_apply.prompt` as-is.
+
+---
+
+## 19. Notes
 
 
 - Paths like `C:/tmp/...` should be adjusted to your actual repo locations.
