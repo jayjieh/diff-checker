@@ -440,6 +440,8 @@ Use this to generate a full migration plan across classification, module similar
 > `path_remap_rules = [{"from": "src/main/java/", "to": "app/src/main/java/", "mode": "prefix"}]`  
 > `module_map_override = null`  
 > `package_map_override = null`  
+> `include_prefixes = ["demo-module-api-1/"]`  
+> `exclude_prefixes = ["demo-module-api-2/", "demo-module-api-3/"]`  
 > `include_staged = true`  
 > `include_untracked = true`.  
 > Create a markdown section `## Migration Plan Summary` with:

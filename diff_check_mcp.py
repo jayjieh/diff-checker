@@ -1291,6 +1291,8 @@ def generate_migration_plan(
     module_map_override: Optional[Dict[str, Optional[str]]] = None,
     package_map_override: Optional[Dict[str, str]] = None,
     path_remap_rules: Optional[List[Dict[str, str]]] = None,
+    include_prefixes: Optional[List[str]] = None,
+    exclude_prefixes: Optional[List[str]] = None,
     top_n: int = 3,
     min_score: float = 0.1,
     use_cache: bool = True,
@@ -1355,6 +1357,29 @@ def generate_migration_plan(
             path_remap_rules=path_remap_rules,
         )
 
+    if include_prefixes or exclude_prefixes:
+        scan["only_in_left"] = _filter_paths_by_prefixes(
+            scan["only_in_left"], include_prefixes, exclude_prefixes
+        )
+        scan["only_in_right"] = _filter_paths_by_prefixes(
+            scan["only_in_right"], include_prefixes, exclude_prefixes
+        )
+        scan["different_files"] = _filter_paths_by_prefixes(
+            scan["different_files"], include_prefixes, exclude_prefixes
+        )
+        if preview and preview.get("preview"):
+            filtered_preview = []
+            for item in preview["preview"]:
+                src = item.get("source_path", "")
+                if not _filter_paths_by_prefixes([src], include_prefixes, exclude_prefixes):
+                    continue
+                filtered_preview.append(item)
+            preview["preview"] = filtered_preview
+            preview["changed_files"] = _filter_paths_by_prefixes(
+                preview.get("changed_files", []), include_prefixes, exclude_prefixes
+            )
+            preview["changed_files_count"] = len(preview["changed_files"])
+
     suggested_module_map = {}
     for module, candidates in module_similarity.get("module_similarity", {}).items():
         if not candidates:
@@ -1369,6 +1394,8 @@ def generate_migration_plan(
         "module_map_used": module_map,
         "package_map_used": package_map,
         "path_remap_rules": path_remap_rules or [],
+        "include_prefixes": include_prefixes or [],
+        "exclude_prefixes": exclude_prefixes or [],
         "classification": classification,
         "package_roots": {
             "source": pkg_source,
