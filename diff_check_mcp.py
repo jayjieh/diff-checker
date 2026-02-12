@@ -427,6 +427,106 @@ def _filter_paths_by_prefixes(
     return filtered
 
 
+def _read_java_package(path: str, use_cache: bool = True) -> Optional[str]:
+    try:
+        text = _read_file_text_cached(path, use_cache=use_cache)
+    except OSError:
+        return None
+    for line in text.splitlines()[:20]:
+        m = PACKAGE_RE.match(line)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _extract_java_import_block(text: str) -> Dict[str, str]:
+    lines = text.splitlines(keepends=True)
+    if not lines:
+        return {"prefix": "", "imports": "", "suffix": ""}
+
+    start = None
+    end = None
+    for i, line in enumerate(lines):
+        if line.lstrip().startswith("import "):
+            start = i
+            break
+    if start is None:
+        return {"prefix": "".join(lines), "imports": "", "suffix": ""}
+
+    end = start
+    for i in range(start, len(lines)):
+        l = lines[i]
+        if l.lstrip().startswith("import ") or l.strip() == "":
+            end = i
+            continue
+        break
+
+    prefix = "".join(lines[:start])
+    imports = "".join(lines[start:end + 1])
+    suffix = "".join(lines[end + 1:])
+    return {"prefix": prefix, "imports": imports, "suffix": suffix}
+
+
+def _build_java_index(repo_root: str, use_cache: bool = True, refresh_cache: bool = False) -> Dict[str, Any]:
+    files = _collect_java_files(repo_root, use_cache=use_cache, refresh_cache=refresh_cache)
+    by_filename: Dict[str, List[str]] = {}
+    by_package: Dict[str, List[str]] = {}
+
+    for rel, abs_path in files.items():
+        fname = os.path.basename(rel)
+        by_filename.setdefault(fname, []).append(abs_path)
+        pkg = _read_java_package(abs_path, use_cache=use_cache)
+        if pkg:
+            by_package.setdefault(pkg, []).append(abs_path)
+
+    return {
+        "by_filename": by_filename,
+        "by_package": by_package,
+    }
+
+
+def _choose_target_java_path(
+    source_rel: str,
+    source_abs: str,
+    target_root: str,
+    target_index: Dict[str, Any],
+    source_root_pkg: Optional[str],
+    target_root_pkg: Optional[str],
+    use_cache: bool = True,
+) -> Dict[str, Any]:
+    filename = os.path.basename(source_rel)
+    src_pkg = _read_java_package(source_abs, use_cache=use_cache)
+    candidates: List[str] = []
+    reason = "filename"
+
+    if src_pkg and source_root_pkg and target_root_pkg and src_pkg.startswith(source_root_pkg):
+        suffix = src_pkg[len(source_root_pkg):]
+        if suffix.startswith("."):
+            suffix = suffix[1:]
+        target_pkg = target_root_pkg + (("." + suffix) if suffix else "")
+        pkg_matches = target_index["by_package"].get(target_pkg, [])
+        candidates = [p for p in pkg_matches if os.path.basename(p) == filename]
+        reason = "package_root"
+
+    if not candidates:
+        candidates = target_index["by_filename"].get(filename, [])
+        reason = "filename"
+
+    if not candidates:
+        return {"status": "not_found", "reason": reason, "candidates": []}
+
+    if len(candidates) == 1:
+        return {"status": "ok", "path": candidates[0], "reason": reason}
+
+    # Prefer same parent dir name ("one package up")
+    src_parent = os.path.basename(os.path.dirname(source_rel))
+    preferred = [p for p in candidates if os.path.basename(os.path.dirname(p)) == src_parent]
+    if len(preferred) == 1:
+        return {"status": "ok", "path": preferred[0], "reason": reason + "_parent_match"}
+
+    return {"status": "ambiguous", "reason": reason, "candidates": candidates}
+
+
 # ====================================================================================
 # Repo analysis helpers
 # ====================================================================================
@@ -1497,10 +1597,15 @@ def generate_migration_plan(
             "context_lines": "Lines of diff context to include when building patches.",
             "path_remap_rules": "Optional path remap rules for target layout.",
             "apply_check": "When mode=apply, run git apply --check first (recommended).",
+            "map_by_package_roots": "If true, map Java files across different root packages using package roots + filename.",
+            "ignore_imports": "If true, keep original target import block after apply (ignore import changes).",
+            "source_root_package_override": "Optional override for source root package.",
+            "target_root_package_override": "Optional override for target root package.",
         },
         "notes": [
             "Uses backups (.bak) for existing target files during apply; failed applies keep backups.",
             "For package/module moves, use path_remap_rules or filter files before applying.",
+            "When map_by_package_roots is enabled, ambiguous matches are skipped with candidates listed.",
         ],
     }
 
@@ -1858,6 +1963,10 @@ def merge_changes_tool(
     context_lines: int = 3,
     path_remap_rules: Optional[List[Dict[str, str]]] = None,
     apply_check: bool = True,
+    map_by_package_roots: bool = False,
+    ignore_imports: bool = False,
+    source_root_package_override: Optional[str] = None,
+    target_root_package_override: Optional[str] = None,
 ) -> Dict[str, Any]:
     source_root = _validate_repo_path(source_repo_path)
     target_root = _validate_repo_path(target_repo_path)
@@ -1874,14 +1983,41 @@ def merge_changes_tool(
     changed_files = changed_info["changed_files"]
     untracked_set = set(changed_info["untracked_files"])
 
+    source_root_pkg = source_root_package_override
+    target_root_pkg = target_root_package_override
+    if map_by_package_roots:
+        if source_root_pkg is None:
+            source_root_pkg = _detect_package_roots_internal(source_root).get("dominant_root_package_guess")
+        if target_root_pkg is None:
+            target_root_pkg = _detect_package_roots_internal(target_root).get("dominant_root_package_guess")
+
+    target_index = None
+    if map_by_package_roots:
+        target_index = _build_java_index(target_root, use_cache=True)
+
     preview_items = []
     for rel in changed_files:
         target_rel = _apply_path_remap(rel, path_remap_rules)
         target_abs = os.path.join(target_root, target_rel)
+        mapping = None
+        if map_by_package_roots and rel.endswith(".java") and os.path.isfile(os.path.join(source_root, rel)):
+            mapping = _choose_target_java_path(
+                rel,
+                os.path.join(source_root, rel),
+                target_root,
+                target_index,
+                source_root_pkg,
+                target_root_pkg,
+                use_cache=True,
+            )
+            if mapping.get("status") == "ok":
+                target_abs = mapping["path"]
+                target_rel = _normalize_path(os.path.relpath(target_abs, target_root))
         preview_items.append({
             "source_path": rel,
             "target_path": target_rel,
             "target_exists": os.path.isfile(target_abs),
+            "mapping": mapping or {},
         })
 
     if mode == "preview":
@@ -1892,6 +2028,10 @@ def merge_changes_tool(
             "include_staged": include_staged,
             "include_untracked": include_untracked,
             "path_remap_rules": path_remap_rules or [],
+            "map_by_package_roots": map_by_package_roots,
+            "ignore_imports": ignore_imports,
+            "source_root_package": source_root_pkg,
+            "target_root_package": target_root_pkg,
             "changed_files_count": len(changed_files),
             "changed_files": changed_files,
             "preview": preview_items,
@@ -1914,6 +2054,37 @@ def merge_changes_tool(
             continue
 
         target_rel = _apply_path_remap(rel, path_remap_rules)
+        mapping = None
+        if map_by_package_roots and rel.endswith(".java") and os.path.isfile(os.path.join(source_root, rel)):
+            mapping = _choose_target_java_path(
+                rel,
+                os.path.join(source_root, rel),
+                target_root,
+                target_index,
+                source_root_pkg,
+                target_root_pkg,
+                use_cache=True,
+            )
+            if mapping.get("status") == "ok":
+                target_abs = mapping["path"]
+                target_rel = _normalize_path(os.path.relpath(target_abs, target_root))
+            elif mapping.get("status") == "ambiguous":
+                results.append({
+                    "source_path": rel,
+                    "target_path": target_rel,
+                    "status": "skipped",
+                    "reason": "ambiguous_target_match",
+                    "candidates": mapping.get("candidates", []),
+                })
+                continue
+            elif mapping.get("status") == "not_found":
+                results.append({
+                    "source_path": rel,
+                    "target_path": target_rel,
+                    "status": "skipped",
+                    "reason": "target_not_found_by_package",
+                })
+                continue
         patch_parts = []
 
         # Untracked files: use no-index diff against /dev/null
@@ -1959,6 +2130,7 @@ def merge_changes_tool(
 
         target_abs = os.path.join(target_root, target_rel)
         backup_path = None
+        original_target_text = None
 
         check_result = None
         if mode == "check" or apply_check:
@@ -2008,6 +2180,11 @@ def merge_changes_tool(
             backup_path = target_abs + ".bak"
             os.makedirs(os.path.dirname(backup_path), exist_ok=True)
             shutil.copy2(target_abs, backup_path)
+            if ignore_imports and target_abs.endswith(".java"):
+                try:
+                    original_target_text = _read_file_text_cached(target_abs, use_cache=True)
+                except OSError:
+                    original_target_text = None
 
         apply_proc = subprocess.run(
             ["git", "-C", target_root, "apply", "--binary", "--whitespace=nowarn"],
@@ -2018,6 +2195,17 @@ def merge_changes_tool(
         )
 
         if apply_proc.returncode == 0:
+            if ignore_imports and original_target_text is not None and target_abs.endswith(".java"):
+                try:
+                    applied_text = _read_file_text_cached(target_abs, use_cache=False)
+                    orig_blocks = _extract_java_import_block(original_target_text)
+                    new_blocks = _extract_java_import_block(applied_text)
+                    if orig_blocks["imports"]:
+                        merged_text = orig_blocks["prefix"] + orig_blocks["imports"] + new_blocks["suffix"]
+                        with open(target_abs, "w", encoding="utf-8") as f:
+                            f.write(merged_text)
+                except OSError:
+                    pass
             if backup_path and os.path.isfile(backup_path):
                 os.remove(backup_path)
             results.append({
@@ -2025,6 +2213,7 @@ def merge_changes_tool(
                 "target_path": target_rel,
                 "status": "applied",
                 "patch_meta": patch_meta,
+                "mapping": mapping or {},
             })
         else:
             results.append({
@@ -2035,6 +2224,7 @@ def merge_changes_tool(
                 "backup": backup_path,
                 "check": check_result,
                 "patch_meta": patch_meta,
+                "mapping": mapping or {},
             })
 
     return {
@@ -2046,6 +2236,10 @@ def merge_changes_tool(
         "mode": mode,
         "path_remap_rules": path_remap_rules or [],
         "apply_check": apply_check,
+        "map_by_package_roots": map_by_package_roots,
+        "ignore_imports": ignore_imports,
+        "source_root_package": source_root_pkg,
+        "target_root_package": target_root_pkg,
         "results": results,
     }
 

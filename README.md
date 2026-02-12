@@ -381,6 +381,8 @@ Use this to preview, check, and apply changes from a source repo into a target r
 > `allow_files = ["src/main/java/core/JobIdConverter.java", "src/main/resources/app.yml"]`  
 > `path_remap_rules = [{"from": "src/main/java/", "to": "app/src/main/java/", "mode": "prefix"}]`  
 > `apply_check = true`  
+> `map_by_package_roots = true`  
+> `ignore_imports = true`  
 > `include_staged = true`  
 > `include_untracked = true`.  
 > Create a markdown section `## Merge Apply Results (Since abc1234)` summarizing counts of `applied`, `failed`, and `skipped`,  
