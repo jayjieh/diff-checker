@@ -1388,6 +1388,122 @@ def generate_migration_plan(
         if best["score"] >= min_score:
             suggested_module_map[module] = best["module_b"]
 
+    merge_prompts = {
+        "single_file_check": {
+            "prompt": (
+                "Call `merge_changes_tool` with:\n"
+                f"source_repo_path = \"{source_root}\"\n"
+                f"target_repo_path = \"{target_root}\"\n"
+                f"source_commit = \"{source_commit or 'abc1234'}\"\n"
+                "mode = \"check\"\n"
+                "allow_files = [\"src/main/java/com/example/Foo.java\"]\n"
+                f"path_remap_rules = {path_remap_rules or []}\n"
+                "include_staged = true\n"
+                "include_untracked = false"
+            )
+        },
+        "single_file_apply": {
+            "prompt": (
+                "Call `merge_changes_tool` with:\n"
+                f"source_repo_path = \"{source_root}\"\n"
+                f"target_repo_path = \"{target_root}\"\n"
+                f"source_commit = \"{source_commit or 'abc1234'}\"\n"
+                "mode = \"apply\"\n"
+                "allow_files = [\"src/main/java/com/example/Foo.java\"]\n"
+                f"path_remap_rules = {path_remap_rules or []}\n"
+                "apply_check = true\n"
+                "include_staged = true\n"
+                "include_untracked = false"
+            )
+        },
+        "list_check": {
+            "prompt": (
+                "Call `merge_changes_tool` with:\n"
+                f"source_repo_path = \"{source_root}\"\n"
+                f"target_repo_path = \"{target_root}\"\n"
+                f"source_commit = \"{source_commit or 'abc1234'}\"\n"
+                "mode = \"check\"\n"
+                "allow_files = [\"src/main/java/com/example/A.java\", \"src/main/java/com/example/B.java\"]\n"
+                f"path_remap_rules = {path_remap_rules or []}\n"
+                "include_staged = true\n"
+                "include_untracked = false"
+            )
+        },
+        "list_apply": {
+            "prompt": (
+                "Call `merge_changes_tool` with:\n"
+                f"source_repo_path = \"{source_root}\"\n"
+                f"target_repo_path = \"{target_root}\"\n"
+                f"source_commit = \"{source_commit or 'abc1234'}\"\n"
+                "mode = \"apply\"\n"
+                "allow_files = [\"src/main/java/com/example/A.java\", \"src/main/java/com/example/B.java\"]\n"
+                f"path_remap_rules = {path_remap_rules or []}\n"
+                "apply_check = true\n"
+                "include_staged = true\n"
+                "include_untracked = false"
+            )
+        },
+        "package_check": {
+            "prompt": (
+                "Call `list_changed_files_since_commit` with:\n"
+                f"repo_path = \"{source_root}\"\n"
+                f"commit = \"{source_commit or 'abc1234'}\"\n"
+                "include_staged = true\n"
+                "include_untracked = false\n"
+                "include_prefixes = [\"src/main/java/com/example/\"]\n\n"
+                "Then call `merge_changes_tool` with the returned `changed_files` as `allow_files`:\n"
+                f"source_repo_path = \"{source_root}\"\n"
+                f"target_repo_path = \"{target_root}\"\n"
+                f"source_commit = \"{source_commit or 'abc1234'}\"\n"
+                "mode = \"check\"\n"
+                "allow_files = <changed_files from previous call>\n"
+                f"path_remap_rules = {path_remap_rules or []}\n"
+                "include_staged = true\n"
+                "include_untracked = false"
+            )
+        },
+        "package_apply": {
+            "prompt": (
+                "Call `list_changed_files_since_commit` with:\n"
+                f"repo_path = \"{source_root}\"\n"
+                f"commit = \"{source_commit or 'abc1234'}\"\n"
+                "include_staged = true\n"
+                "include_untracked = false\n"
+                "include_prefixes = [\"src/main/java/com/example/\"]\n\n"
+                "Then call `merge_changes_tool` with the returned `changed_files` as `allow_files`:\n"
+                f"source_repo_path = \"{source_root}\"\n"
+                f"target_repo_path = \"{target_root}\"\n"
+                f"source_commit = \"{source_commit or 'abc1234'}\"\n"
+                "mode = \"apply\"\n"
+                "allow_files = <changed_files from previous call>\n"
+                f"path_remap_rules = {path_remap_rules or []}\n"
+                "apply_check = true\n"
+                "include_staged = true\n"
+                "include_untracked = false"
+            )
+        },
+    }
+
+    merge_tool_help = {
+        "description": "Applies diffs from source repo to target repo using git apply. Supports preview, check, and apply.",
+        "parameters": {
+            "source_repo_path": "Source repo path. Must be a git repo.",
+            "target_repo_path": "Target repo path. Must be a git repo.",
+            "source_commit": "Commit to diff against in source repo (changes since this commit).",
+            "mode": "preview = list changes, check = dry-run apply, apply = apply patch.",
+            "allow_files": "When mode is check/apply: list of source-relative file paths to apply.",
+            "include_staged": "Include staged changes from source.",
+            "include_untracked": "Include untracked files from source.",
+            "context_lines": "Lines of diff context to include when building patches.",
+            "path_remap_rules": "Optional path remap rules for target layout.",
+            "apply_check": "When mode=apply, run git apply --check first (recommended).",
+        },
+        "notes": [
+            "Uses backups (.bak) for existing target files during apply; failed applies keep backups.",
+            "For package/module moves, use path_remap_rules or filter files before applying.",
+        ],
+    }
+
     return {
         "source_root": source_root,
         "target_root": target_root,
@@ -1412,6 +1528,8 @@ def generate_migration_plan(
         },
         "diff_stats": diff_stats,
         "merge_preview": preview,
+        "merge_tool_help": merge_tool_help,
+        "merge_prompt_templates": merge_prompts,
     }
 
 
