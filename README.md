@@ -1,8 +1,8 @@
-# Repo Diff MCP Server – Copilot Usage Guide
+# Repo Diff MCP Server - Copilot Usage Guide
 
 This project exposes a local **MCP server** (`repo-diff-enhanced`) that helps compare:
 
-- Quarkus multi-module repo ↔ Spring Boot repos
+- Quarkus multi-module repo <-> Spring Boot repos
 - Code structure & file content
 - Modules & packages
 - REST APIs vs OpenAPI specs
@@ -24,12 +24,15 @@ Core tools:
 - `detect_package_roots`
 - `detect_module_similarity`
 - `scan_repos`
+- `get_diff_stats`
 - `get_file_diff`
   - `list_changed_files_since_commit`
   - `get_diff_since_commit`
   - `merge_changes_tool`
   - `clear_backup`
+  - `restore_backup`
   - `scan_quarkus_modules_vs_spring_projects`
+- `generate_migration_plan`
 - `analyze_api_differences`
 - `write_to_readme`
 
@@ -70,7 +73,7 @@ If it shows up, the config is good.
 
 ---
 
-## 4. Analyze Individual Repos → README
+## 4. Analyze Individual Repos -> README
 
 ### 4.1 Analyze Quarkus repo
 
@@ -99,7 +102,7 @@ If it shows up, the config is good.
 
 ---
 
-## 5. Classify Repos (Quarkus vs Spring) → README
+## 5. Classify Repos (Quarkus vs Spring) -> README
 
 **Prompt:**
 
@@ -113,7 +116,7 @@ If it shows up, the config is good.
 
 ---
 
-## 6. Detect Package Roots → README
+## 6. Detect Package Roots -> README
 
 Use this to discover dominant Java package roots in each repo.
 
@@ -130,7 +133,7 @@ Use this to discover dominant Java package roots in each repo.
 
 ---
 
-## 7. Detect Module Similarity → README
+## 7. Detect Module Similarity -> README
 
 This helps map Quarkus modules to Spring modules/projects.
 
@@ -149,7 +152,7 @@ This helps map Quarkus modules to Spring modules/projects.
 
 ---
 
-## 8. Whole Repo Diff (`scan_repos`) → README
+## 8. Whole Repo Diff (`scan_repos`) -> README
 
 This compares all Java files between two repos using module & package normalization.
 
@@ -165,7 +168,7 @@ This compares all Java files between two repos using module & package normalizat
 
 ---
 
-## 9. Changed Since Commit + Diff (`scan_repos`) → README
+## 9. Changed Since Commit + Diff (`scan_repos`) -> README
 
 Use this when you want to limit the comparison to files changed since a specific commit
 in the left repo, then compare those files against the right repo.
@@ -185,7 +188,7 @@ in the left repo, then compare those files against the right repo.
 
 ---
 
-## 10. Single File Diff (`get_file_diff`) → README
+## 10. Single File Diff (`get_file_diff`) -> README
 
 After `scan_repos`, pick one normalized key from `different_files`  
 (e.g. `src/main/java/core/JobIdConverter.java`).
@@ -204,7 +207,7 @@ After `scan_repos`, pick one normalized key from `different_files`
 
 ---
 
-## 11. Quarkus Modules vs Spring Projects → README
+## 11. Quarkus Modules vs Spring Projects -> README
 
 Use this when the **Quarkus repo is multi-module** and the **Spring side is split into separate repos**.
 
@@ -240,7 +243,7 @@ Use this when the **Quarkus repo is multi-module** and the **Spring side is spli
 
 ---
 
-## 12. API Differences (Quarkus REST vs Spring OpenAPI) → README
+## 12. API Differences (Quarkus REST vs Spring OpenAPI) -> README
 
 ### 12.1 If you know the OpenAPI spec path
 
@@ -327,9 +330,9 @@ Whenever you run any MCP tool and want the result saved:
 ---
 
 
-## 15. Merge Changes → README
+## 15. Merge Changes -> README
 
-Use this to preview and apply changes from a source repo into a target repo.
+Use this to preview, check, and apply changes from a source repo into a target repo.
 
 ### 15.1 Preview changes
 
@@ -340,13 +343,31 @@ Use this to preview and apply changes from a source repo into a target repo.
 > `target_repo_path = "C:/tmp/spring-project"`  
 > `source_commit = "abc1234"`  
 > `mode = "preview"`  
+> `path_remap_rules = [{"from": "src/main/java/", "to": "app/src/main/java/", "mode": "prefix"}]`  
 > `include_staged = true`  
 > `include_untracked = true`.  
 > Create a markdown section `## Preview Merge (Since abc1234)` listing the total `changed_files_count`  
-> and a table of the first 30 `preview` entries with columns `Path | Target Exists`.  
+> and a table of the first 30 `preview` entries with columns `Source Path | Target Path | Target Exists`.  
 > Append this section to `C:/tmp/diff-report/README.md` using `write_to_readme`.
 
-### 15.2 Apply approved changes
+### 15.2 Check apply (dry run)
+
+**Prompt:**
+
+> Call `merge_changes_tool` with:  
+> `source_repo_path = "C:/tmp/quarkus-project"`  
+> `target_repo_path = "C:/tmp/spring-project"`  
+> `source_commit = "abc1234"`  
+> `mode = "check"`  
+> `allow_files = ["src/main/java/core/JobIdConverter.java", "src/main/resources/app.yml"]`  
+> `path_remap_rules = [{"from": "src/main/java/", "to": "app/src/main/java/", "mode": "prefix"}]`  
+> `include_staged = true`  
+> `include_untracked = true`.  
+> Create a markdown section `## Merge Check Results (Since abc1234)` summarizing counts of `check_ok`, `check_failed`, and `skipped`,  
+> and list failed entries with their `error`.  
+> Append it to `C:/tmp/diff-report/README.md` using `write_to_readme`.
+
+### 15.3 Apply approved changes
 
 **Prompt:**
 
@@ -356,13 +377,15 @@ Use this to preview and apply changes from a source repo into a target repo.
 > `source_commit = "abc1234"`  
 > `mode = "apply"`  
 > `allow_files = ["src/main/java/core/JobIdConverter.java", "src/main/resources/app.yml"]`  
+> `path_remap_rules = [{"from": "src/main/java/", "to": "app/src/main/java/", "mode": "prefix"}]`  
+> `apply_check = true`  
 > `include_staged = true`  
 > `include_untracked = true`.  
 > Create a markdown section `## Merge Apply Results (Since abc1234)` summarizing counts of `applied`, `failed`, and `skipped`,  
 > and list failed entries with their `error` and `backup` path.  
 > Append it to `C:/tmp/diff-report/README.md` using `write_to_readme`.
 
-### 15.3 Clear backups
+### 15.4 Clear backups
 
 **Prompt:**
 
@@ -371,15 +394,70 @@ Use this to preview and apply changes from a source repo into a target repo.
 > `dry_run = true`.  
 > If the list looks safe, call `clear_backup` again with `dry_run = false`.
 
+### 15.5 Restore backups
+
+**Prompt:**
+
+> Call `restore_backup` with:  
+> `repo_path = "C:/tmp/spring-project"`  
+> `dry_run = true`  
+> `overwrite_existing = false`.  
+> If the list looks safe, call `restore_backup` again with `dry_run = false`.
+
 ---
-## 16. Notes
+
+## 16. Diff Stats (`get_diff_stats`) -> README
+
+Use this to get line-level add/remove counts for differing files.
+
+**Prompt:**
+
+> Call `get_diff_stats` with:  
+> `left_repo_path = "C:/tmp/quarkus-project"`  
+> `right_repo_path = "C:/tmp/spring-project"`  
+> `left_commit = null`  
+> `max_files = 200`.  
+> Create a markdown section `## Diff Stats (Quarkus vs Spring)` summarizing:
+> - counts for `only_in_left`, `only_in_right`, `different`, `identical`, `total_common`
+> - `line_stats.total_added` and `line_stats.total_removed`
+> - a small table from `per_file` (first 20 rows).
+> Append this section to `C:/tmp/diff-report/README.md` using `write_to_readme`.
+
+---
+
+## 17. Migration Plan (`generate_migration_plan`) -> README
+
+Use this to generate a full migration plan across classification, module similarity, diffs, and optional merge preview.
+
+**Prompt:**
+
+> Call `generate_migration_plan` with:  
+> `source_repo_path = "C:/tmp/quarkus-project"`  
+> `target_repo_path = "C:/tmp/spring-project"`  
+> `source_commit = "abc1234"`  
+> `path_remap_rules = [{"from": "src/main/java/", "to": "app/src/main/java/", "mode": "prefix"}]`  
+> `module_map_override = null`  
+> `package_map_override = null`  
+> `include_staged = true`  
+> `include_untracked = true`.  
+> Create a markdown section `## Migration Plan Summary` with:
+> - classification summary (Quarkus vs Spring)
+> - suggested module map from `suggested_module_map`
+> - scan summary counts
+> - diff stats totals
+> - merge preview counts (if present)
+> Append this section to `C:/tmp/diff-report/README.md` using `write_to_readme`.
+
+---
+## 18. Notes
+
 
 - Paths like `C:/tmp/...` should be adjusted to your actual repo locations.
-- `MANUAL_MODULE_MAP` and `PACKAGE_MAP` are currently defined in Python, but you can extend the server later to pass them as parameters if needed.
+- `MANUAL_MODULE_MAP` and `PACKAGE_MAP` are defined in Python, but you can override them per tool call using `module_map_override` and `package_map_override`.
 - For deeper diffs, combine:
-  - `scan_repos` → list changed files  
-  - `get_file_diff` → inspect key classes  
-  - `analyze_api_differences` → check REST vs OpenAPI coverage  
-  - `scan_quarkus_modules_vs_spring_projects` → validate each module migration
+  - `scan_repos` -> list changed files  
+  - `get_file_diff` -> inspect key classes  
+  - `analyze_api_differences` -> check REST vs OpenAPI coverage  
+  - `scan_quarkus_modules_vs_spring_projects` -> validate each module migration
 
 This README is meant to be **copied as-is** into your project so future you can just open Copilot Chat and follow the prompts.

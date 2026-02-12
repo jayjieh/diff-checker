@@ -8,6 +8,8 @@ import datetime
 import xml.etree.ElementTree as ET
 import subprocess
 import shutil
+import hashlib
+import threading
 from typing import List, Dict, Any, Optional
 from collections import Counter
 
@@ -50,6 +52,65 @@ def log_startup():
 # Helper Functions
 # ====================================================================================
 
+_CACHE_LOCK = threading.RLock()
+_REPO_CACHE: Dict[str, Dict[str, Any]] = {}
+_FILE_TEXT_CACHE: Dict[str, Dict[str, Any]] = {}
+_FILE_HASH_CACHE: Dict[str, Dict[str, Any]] = {}
+_CACHE_MAX_TEXT = 512
+_CACHE_MAX_HASH = 4096
+
+
+def _prune_cache(cache: Dict[str, Dict[str, Any]], max_entries: int) -> None:
+    if len(cache) <= max_entries:
+        return
+    # Simple prune: drop oldest entries by last_access
+    items = sorted(cache.items(), key=lambda kv: kv[1].get("last_access", 0))
+    for k, _ in items[: max(0, len(cache) - max_entries)]:
+        cache.pop(k, None)
+
+
+def _repo_state_signature(repo_root: str, include_untracked: bool = True) -> str:
+    try:
+        head = _git(repo_root, ["rev-parse", "HEAD"]).strip()
+    except Exception:
+        head = "no-head"
+    status_args = ["status", "--porcelain", "-z"]
+    if not include_untracked:
+        status_args.append("-uno")
+    try:
+        status = _git(repo_root, status_args)
+    except Exception:
+        status = ""
+    data = (head + "\0" + status).encode("utf-8", errors="ignore")
+    return hashlib.sha1(data).hexdigest()
+
+
+def _get_java_files_cached(
+    repo_root: str,
+    use_cache: bool = True,
+    refresh_cache: bool = False,
+    include_untracked: bool = True,
+) -> Dict[str, str]:
+    if not use_cache:
+        return _collect_java_files(repo_root, use_cache=False)
+
+    sig = _repo_state_signature(repo_root, include_untracked=include_untracked)
+    with _CACHE_LOCK:
+        entry = _REPO_CACHE.get(repo_root)
+        if entry and not refresh_cache and entry.get("state_sig") == sig:
+            entry["last_access"] = datetime.datetime.now().timestamp()
+            return entry["java_files"]
+
+    files = _collect_java_files(repo_root, use_cache=False)
+    with _CACHE_LOCK:
+        _REPO_CACHE[repo_root] = {
+            "state_sig": sig,
+            "java_files": files,
+            "last_access": datetime.datetime.now().timestamp(),
+        }
+        _prune_cache(_REPO_CACHE, 64)
+    return files
+
 def _normalize_path(path: str) -> str:
     norm = os.path.normpath(path)
     norm = norm.replace(os.sep, "/")
@@ -65,6 +126,66 @@ def _read_file_text(path: str) -> str:
             continue
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         return f.read()
+
+
+def _read_file_text_cached(path: str, use_cache: bool = True) -> str:
+    if not use_cache:
+        return _read_file_text(path)
+
+    try:
+        st = os.stat(path)
+    except OSError:
+        return _read_file_text(path)
+
+    cache_key = f"{path}|{st.st_mtime_ns}|{st.st_size}"
+    with _CACHE_LOCK:
+        entry = _FILE_TEXT_CACHE.get(cache_key)
+        if entry:
+            entry["last_access"] = datetime.datetime.now().timestamp()
+            return entry["text"]
+
+    text = _read_file_text(path)
+    with _CACHE_LOCK:
+        _FILE_TEXT_CACHE[cache_key] = {
+            "text": text,
+            "last_access": datetime.datetime.now().timestamp(),
+        }
+        _prune_cache(_FILE_TEXT_CACHE, _CACHE_MAX_TEXT)
+    return text
+
+
+def _file_hash(path: str, use_cache: bool = True) -> str:
+    if not use_cache:
+        return _file_hash_uncached(path)
+
+    try:
+        st = os.stat(path)
+    except OSError:
+        return _file_hash_uncached(path)
+
+    cache_key = f"{path}|{st.st_mtime_ns}|{st.st_size}"
+    with _CACHE_LOCK:
+        entry = _FILE_HASH_CACHE.get(cache_key)
+        if entry:
+            entry["last_access"] = datetime.datetime.now().timestamp()
+            return entry["hash"]
+
+    h = _file_hash_uncached(path)
+    with _CACHE_LOCK:
+        _FILE_HASH_CACHE[cache_key] = {
+            "hash": h,
+            "last_access": datetime.datetime.now().timestamp(),
+        }
+        _prune_cache(_FILE_HASH_CACHE, _CACHE_MAX_HASH)
+    return h
+
+
+def _file_hash_uncached(path: str) -> str:
+    h = hashlib.sha1()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def _git(repo_root: str, args: List[str]) -> str:
@@ -138,7 +259,25 @@ def _collect_changed_files(
     }
 
 
-def _collect_java_files(root: str, exclude_dirs=None) -> Dict[str, str]:
+def _collect_java_files(
+    root: str,
+    exclude_dirs=None,
+    use_cache: bool = True,
+    refresh_cache: bool = False,
+    include_untracked: bool = True,
+) -> Dict[str, str]:
+    # If caller uses custom excludes, skip cache to avoid mismatched results.
+    if exclude_dirs:
+        use_cache = False
+
+    if use_cache:
+        return _get_java_files_cached(
+            root,
+            use_cache=True,
+            refresh_cache=refresh_cache,
+            include_untracked=include_untracked,
+        )
+
     exclude_dirs = set(exclude_dirs or [])
     files: Dict[str, str] = {}
 
@@ -162,22 +301,102 @@ def _collect_java_files(root: str, exclude_dirs=None) -> Dict[str, str]:
 
 
 def normalize_java_relpath(rel: str) -> str:
+    return normalize_java_relpath_with_maps(rel, MANUAL_MODULE_MAP, PACKAGE_MAP)
+
+
+def normalize_java_relpath_with_maps(
+    rel: str,
+    module_map: Optional[Dict[str, Optional[str]]] = None,
+    package_map: Optional[Dict[str, str]] = None,
+) -> str:
     """
     Normalize Java file paths by:
-      - stripping known module prefixes
+      - stripping or remapping known module prefixes
       - applying package mapping
     This gives a cross-repo comparable key like:
         src/main/java/.../JobIdConverter.java
     """
+    module_map = module_map or {}
+    package_map = package_map or {}
+
     parts = rel.split("/")
-    if parts and parts[0] in MANUAL_MODULE_MAP:
-        parts = parts[1:]
+    if parts and parts[0] in module_map:
+        mapped = module_map.get(parts[0])
+        if mapped is None:
+            parts = parts[1:]
+        else:
+            parts[0] = mapped
     rel = "/".join(parts)
 
-    for left_pkg, right_pkg in PACKAGE_MAP.items():
+    for left_pkg, right_pkg in package_map.items():
         rel = rel.replace(left_pkg.replace(".", "/"), right_pkg.replace(".", "/"))
 
     return rel
+
+
+def _apply_path_remap(rel_path: str, rules: Optional[List[Dict[str, str]]]) -> str:
+    if not rules:
+        return rel_path
+    for rule in rules:
+        src = rule.get("from")
+        dst = rule.get("to", "")
+        mode = rule.get("mode", "prefix")
+        if not src:
+            continue
+        if mode == "prefix":
+            if rel_path.startswith(src):
+                return dst + rel_path[len(src):]
+        elif mode == "replace":
+            if src in rel_path:
+                return rel_path.replace(src, dst)
+        elif mode == "regex":
+            try:
+                if re.search(src, rel_path):
+                    return re.sub(src, dst, rel_path)
+            except re.error:
+                continue
+    return rel_path
+
+
+def _rewrite_patch_paths(patch_text: str, old_path: str, new_path: str) -> str:
+    if old_path == new_path:
+        return patch_text
+
+    lines = []
+    for line in patch_text.splitlines(keepends=True):
+        if line.startswith("diff --git "):
+            parts = line.strip().split()
+            if len(parts) >= 4 and parts[2] == old_path and parts[3] == old_path:
+                line = line.replace(f"diff --git {old_path} {old_path}",
+                                   f"diff --git {new_path} {new_path}")
+        elif line.startswith("--- ") or line.startswith("+++ "):
+            prefix = line[:4]
+            path = line[4:].strip()
+            if path == old_path:
+                line = prefix + new_path + ("\n" if line.endswith("\n") else "")
+        elif line.startswith("rename from "):
+            path = line[len("rename from "):].strip()
+            if path == old_path:
+                line = "rename from " + new_path + ("\n" if line.endswith("\n") else "")
+        elif line.startswith("rename to "):
+            path = line[len("rename to "):].strip()
+            if path == old_path:
+                line = "rename to " + new_path + ("\n" if line.endswith("\n") else "")
+        lines.append(line)
+    return "".join(lines)
+
+
+def _patch_line_stats(patch_text: str) -> Dict[str, int]:
+    added = 0
+    removed = 0
+    for line in patch_text.splitlines():
+        if line.startswith("+++ ") or line.startswith("--- "):
+            continue
+        if line.startswith("+"):
+            added += 1
+        elif line.startswith("-"):
+            removed += 1
+    return {"added": added, "removed": removed}
 
 
 # ====================================================================================
@@ -391,9 +610,14 @@ def _analyze_repo_internal(repo_root: str) -> Dict[str, Any]:
 PACKAGE_RE = re.compile(r'^\s*package\s+([a-zA-Z0-9_.]+)\s*;')
 
 
-def _detect_package_roots_internal(repo_root: str, max_files: int = 5000) -> Dict[str, Any]:
+def _detect_package_roots_internal(
+    repo_root: str,
+    max_files: int = 5000,
+    use_cache: bool = True,
+    refresh_cache: bool = False,
+) -> Dict[str, Any]:
     root = os.path.abspath(repo_root)
-    java_files = _collect_java_files(root)
+    java_files = _collect_java_files(root, use_cache=use_cache, refresh_cache=refresh_cache)
     pkg_counts: Counter[str] = Counter()
 
     for i, (_, path) in enumerate(java_files.items()):
@@ -433,9 +657,19 @@ def _detect_package_roots_internal(repo_root: str, max_files: int = 5000) -> Dic
 
 
 @mcp.tool(title="Detect dominant package roots in a repo")
-def detect_package_roots(repo_path: str, max_files: int = 5000) -> Dict[str, Any]:
+def detect_package_roots(
+    repo_path: str,
+    max_files: int = 5000,
+    use_cache: bool = True,
+    refresh_cache: bool = False,
+) -> Dict[str, Any]:
     root = _validate_repo_path(repo_path)
-    return _detect_package_roots_internal(root, max_files=max_files)
+    return _detect_package_roots_internal(
+        root,
+        max_files=max_files,
+        use_cache=use_cache,
+        refresh_cache=refresh_cache,
+    )
 
 
 # ====================================================================================
@@ -462,8 +696,14 @@ def _discover_modules_for_similarity(root: str) -> Dict[str, str]:
     return modules
 
 
-def _module_fingerprint(module_root: str) -> Dict[str, Any]:
-    java_files = _collect_java_files(module_root)
+def _module_fingerprint(
+    module_root: str,
+    use_cache: bool = True,
+    refresh_cache: bool = False,
+) -> Dict[str, Any]:
+    java_files = _collect_java_files(
+        module_root, use_cache=use_cache, refresh_cache=refresh_cache
+    )
     keys = set()
     for rel in java_files.keys():
         p = rel
@@ -491,6 +731,8 @@ def detect_module_similarity(
     repo_b_path: str,
     top_n: int = 3,
     min_score: float = 0.1,
+    use_cache: bool = True,
+    refresh_cache: bool = False,
 ) -> Dict[str, Any]:
     root_a = _validate_repo_path(repo_a_path)
     root_b = _validate_repo_path(repo_b_path)
@@ -498,8 +740,14 @@ def detect_module_similarity(
     modules_a = _discover_modules_for_similarity(root_a)
     modules_b = _discover_modules_for_similarity(root_b)
 
-    fingerprints_a = {name: _module_fingerprint(path) for name, path in modules_a.items()}
-    fingerprints_b = {name: _module_fingerprint(path) for name, path in modules_b.items()}
+    fingerprints_a = {
+        name: _module_fingerprint(path, use_cache=use_cache, refresh_cache=refresh_cache)
+        for name, path in modules_a.items()
+    }
+    fingerprints_b = {
+        name: _module_fingerprint(path, use_cache=use_cache, refresh_cache=refresh_cache)
+        for name, path in modules_b.items()
+    }
 
     results = {}
 
@@ -552,15 +800,18 @@ HTTP_ANNOTS = {
 PATH_ANNOT_RE = re.compile(r'@Path\s*\(\s*"([^"]+)"\s*\)')
 
 
-def _collect_quarkus_endpoints(quarkus_root: str) -> Dict[str, Any]:
+def _collect_quarkus_endpoints(
+    quarkus_root: str,
+    use_cache: bool = True,
+    refresh_cache: bool = False,
+) -> Dict[str, Any]:
     root = os.path.abspath(quarkus_root)
-    java_files = _collect_java_files(root)
+    java_files = _collect_java_files(root, use_cache=use_cache, refresh_cache=refresh_cache)
     endpoints = []
 
     for rel, abs_path in java_files.items():
         try:
-            with open(abs_path, "r", encoding="utf-8", errors="ignore") as f:
-                lines = f.readlines()
+            lines = _read_file_text_cached(abs_path, use_cache=use_cache).splitlines()
         except OSError:
             continue
 
@@ -717,11 +968,15 @@ def analyze_api_differences(
     quarkus_repo_path: str,
     spring_repo_path: str,
     spring_openapi_relative_paths: Optional[List[str]] = None,
+    use_cache: bool = True,
+    refresh_cache: bool = False,
 ) -> Dict[str, Any]:
     quarkus_repo_path = _validate_repo_path(quarkus_repo_path)
     spring_repo_path = _validate_repo_path(spring_repo_path)
 
-    quarkus_info = _collect_quarkus_endpoints(quarkus_repo_path)
+    quarkus_info = _collect_quarkus_endpoints(
+        quarkus_repo_path, use_cache=use_cache, refresh_cache=refresh_cache
+    )
     openapi_info = _collect_openapi_operations(spring_repo_path, spec_relative_paths=spring_openapi_relative_paths)
 
     q_map = {}
@@ -812,15 +1067,26 @@ def scan_repos(
     left_commit: Optional[str] = None,
     include_staged: bool = True,
     include_untracked: bool = False,
+    module_map_override: Optional[Dict[str, Optional[str]]] = None,
+    package_map_override: Optional[Dict[str, str]] = None,
+    use_cache: bool = True,
+    refresh_cache: bool = False,
 ) -> Dict[str, Any]:
     left_root = _validate_repo_path(left_repo_path)
     right_root = _validate_repo_path(right_repo_path)
 
-    left_files = _collect_java_files(left_root)
-    right_files = _collect_java_files(right_root)
+    module_map = MANUAL_MODULE_MAP if module_map_override is None else module_map_override
+    package_map = PACKAGE_MAP if package_map_override is None else package_map_override
 
-    left_norm = {normalize_java_relpath(k): v for k, v in left_files.items()}
-    right_norm = {normalize_java_relpath(k): v for k, v in right_files.items()}
+    left_files = _collect_java_files(
+        left_root, use_cache=use_cache, refresh_cache=refresh_cache, include_untracked=include_untracked
+    )
+    right_files = _collect_java_files(
+        right_root, use_cache=use_cache, refresh_cache=refresh_cache, include_untracked=include_untracked
+    )
+
+    left_norm = {normalize_java_relpath_with_maps(k, module_map, package_map): v for k, v in left_files.items()}
+    right_norm = {normalize_java_relpath_with_maps(k, module_map, package_map): v for k, v in right_files.items()}
 
     left_keys = set(left_norm.keys())
     right_keys = set(right_norm.keys())
@@ -837,7 +1103,7 @@ def scan_repos(
         for rel in result["changed_files"]:
             if not rel.endswith(".java"):
                 continue
-            changed.add(normalize_java_relpath(rel))
+            changed.add(normalize_java_relpath_with_maps(rel, module_map, package_map))
         filtered_changed = sorted(changed)
         left_keys = left_keys & changed
 
@@ -849,10 +1115,17 @@ def scan_repos(
     identical = 0
 
     for key in common:
-        left_text = _read_file_text(left_norm[key])
-        right_text = _read_file_text(right_norm[key])
+        if not package_map:
+            left_hash = _file_hash(left_norm[key], use_cache=use_cache)
+            right_hash = _file_hash(right_norm[key], use_cache=use_cache)
+            if left_hash == right_hash:
+                identical += 1
+                continue
 
-        for lpkg, rpkg in PACKAGE_MAP.items():
+        left_text = _read_file_text_cached(left_norm[key], use_cache=use_cache)
+        right_text = _read_file_text_cached(right_norm[key], use_cache=use_cache)
+
+        for lpkg, rpkg in package_map.items():
             left_text = left_text.replace(f"package {lpkg}", f"package {rpkg}")
 
         if left_text == right_text:
@@ -866,6 +1139,8 @@ def scan_repos(
         "left_commit": left_commit,
         "include_staged": include_staged,
         "include_untracked": include_untracked,
+        "module_map_used": module_map,
+        "package_map_used": package_map,
         "filtered_changed_files": filtered_changed,
         "only_in_left": only_left,
         "only_in_right": only_right,
@@ -875,21 +1150,237 @@ def scan_repos(
     }
 
 
+def _line_diff_stats(left_text: str, right_text: str) -> Dict[str, int]:
+    left_lines = left_text.splitlines()
+    right_lines = right_text.splitlines()
+    sm = difflib.SequenceMatcher(a=left_lines, b=right_lines)
+    added = 0
+    removed = 0
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag in ("replace", "delete"):
+            removed += (i2 - i1)
+        if tag in ("replace", "insert"):
+            added += (j2 - j1)
+    return {"added": added, "removed": removed}
+
+
+@mcp.tool(title="Get diff stats between two Java repos")
+def get_diff_stats(
+    left_repo_path: str,
+    right_repo_path: str,
+    left_commit: Optional[str] = None,
+    include_staged: bool = True,
+    include_untracked: bool = False,
+    module_map_override: Optional[Dict[str, Optional[str]]] = None,
+    package_map_override: Optional[Dict[str, str]] = None,
+    max_files: int = 500,
+    use_cache: bool = True,
+    refresh_cache: bool = False,
+) -> Dict[str, Any]:
+    scan = scan_repos(
+        left_repo_path=left_repo_path,
+        right_repo_path=right_repo_path,
+        left_commit=left_commit,
+        include_staged=include_staged,
+        include_untracked=include_untracked,
+        module_map_override=module_map_override,
+        package_map_override=package_map_override,
+        use_cache=use_cache,
+        refresh_cache=refresh_cache,
+    )
+
+    left_root = scan["left_root"]
+    right_root = scan["right_root"]
+    module_map = scan.get("module_map_used", MANUAL_MODULE_MAP)
+    package_map = scan.get("package_map_used", PACKAGE_MAP)
+
+    left_files = _collect_java_files(
+        left_root, use_cache=use_cache, refresh_cache=refresh_cache, include_untracked=include_untracked
+    )
+    right_files = _collect_java_files(
+        right_root, use_cache=use_cache, refresh_cache=refresh_cache, include_untracked=include_untracked
+    )
+    left_norm = {normalize_java_relpath_with_maps(k, module_map, package_map): v for k, v in left_files.items()}
+    right_norm = {normalize_java_relpath_with_maps(k, module_map, package_map): v for k, v in right_files.items()}
+
+    per_file = []
+    total_added = 0
+    total_removed = 0
+
+    for idx, key in enumerate(scan["different_files"]):
+        if idx >= max_files:
+            break
+        left_path = left_norm.get(key)
+        right_path = right_norm.get(key)
+        if not left_path or not right_path:
+            continue
+        left_text = _read_file_text_cached(left_path, use_cache=use_cache)
+        right_text = _read_file_text_cached(right_path, use_cache=use_cache)
+        for lpkg, rpkg in package_map.items():
+            left_text = left_text.replace(f"package {lpkg}", f"package {rpkg}")
+        stats = _line_diff_stats(left_text, right_text)
+        total_added += stats["added"]
+        total_removed += stats["removed"]
+        per_file.append({
+            "file": key,
+            "added": stats["added"],
+            "removed": stats["removed"],
+        })
+
+    return {
+        "left_root": left_root,
+        "right_root": right_root,
+        "left_commit": left_commit,
+        "include_staged": include_staged,
+        "include_untracked": include_untracked,
+        "module_map_used": module_map,
+        "package_map_used": package_map,
+        "counts": {
+            "only_in_left": len(scan["only_in_left"]),
+            "only_in_right": len(scan["only_in_right"]),
+            "different": len(scan["different_files"]),
+            "identical": scan["identical"],
+            "total_common": scan["total_common"],
+        },
+        "line_stats": {
+            "total_added": total_added,
+            "total_removed": total_removed,
+            "files_considered": len(per_file),
+            "max_files": max_files,
+            "truncated": len(scan["different_files"]) > max_files,
+        },
+        "per_file": per_file,
+    }
+
+
+@mcp.tool(title="Generate a migration plan between two repos")
+def generate_migration_plan(
+    source_repo_path: str,
+    target_repo_path: str,
+    source_commit: Optional[str] = None,
+    include_staged: bool = True,
+    include_untracked: bool = False,
+    module_map_override: Optional[Dict[str, Optional[str]]] = None,
+    package_map_override: Optional[Dict[str, str]] = None,
+    path_remap_rules: Optional[List[Dict[str, str]]] = None,
+    top_n: int = 3,
+    min_score: float = 0.1,
+    use_cache: bool = True,
+    refresh_cache: bool = False,
+) -> Dict[str, Any]:
+    source_root = _validate_repo_path(source_repo_path)
+    target_root = _validate_repo_path(target_repo_path)
+
+    module_map = MANUAL_MODULE_MAP if module_map_override is None else module_map_override
+    package_map = PACKAGE_MAP if package_map_override is None else package_map_override
+
+    classification = classify_two_repos(source_root, target_root)
+    pkg_source = _detect_package_roots_internal(
+        source_root, use_cache=use_cache, refresh_cache=refresh_cache
+    )
+    pkg_target = _detect_package_roots_internal(
+        target_root, use_cache=use_cache, refresh_cache=refresh_cache
+    )
+    module_similarity = detect_module_similarity(
+        repo_a_path=source_root,
+        repo_b_path=target_root,
+        top_n=top_n,
+        min_score=min_score,
+        use_cache=use_cache,
+        refresh_cache=refresh_cache,
+    )
+
+    scan = scan_repos(
+        left_repo_path=source_root,
+        right_repo_path=target_root,
+        left_commit=source_commit,
+        include_staged=include_staged,
+        include_untracked=include_untracked,
+        module_map_override=module_map,
+        package_map_override=package_map,
+        use_cache=use_cache,
+        refresh_cache=refresh_cache,
+    )
+
+    diff_stats = get_diff_stats(
+        left_repo_path=source_root,
+        right_repo_path=target_root,
+        left_commit=source_commit,
+        include_staged=include_staged,
+        include_untracked=include_untracked,
+        module_map_override=module_map,
+        package_map_override=package_map,
+        use_cache=use_cache,
+        refresh_cache=refresh_cache,
+        max_files=200,
+    )
+
+    preview = None
+    if source_commit:
+        preview = merge_changes_tool(
+            source_repo_path=source_root,
+            target_repo_path=target_root,
+            source_commit=source_commit,
+            mode="preview",
+            include_staged=include_staged,
+            include_untracked=include_untracked,
+            path_remap_rules=path_remap_rules,
+        )
+
+    suggested_module_map = {}
+    for module, candidates in module_similarity.get("module_similarity", {}).items():
+        if not candidates:
+            continue
+        best = candidates[0]
+        if best["score"] >= min_score:
+            suggested_module_map[module] = best["module_b"]
+
+    return {
+        "source_root": source_root,
+        "target_root": target_root,
+        "module_map_used": module_map,
+        "package_map_used": package_map,
+        "path_remap_rules": path_remap_rules or [],
+        "classification": classification,
+        "package_roots": {
+            "source": pkg_source,
+            "target": pkg_target,
+        },
+        "module_similarity": module_similarity,
+        "suggested_module_map": suggested_module_map,
+        "scan_summary": {
+            "only_in_source": scan["only_in_left"],
+            "only_in_target": scan["only_in_right"],
+            "different_files": scan["different_files"],
+            "identical": scan["identical"],
+            "total_common": scan["total_common"],
+        },
+        "diff_stats": diff_stats,
+        "merge_preview": preview,
+    }
+
+
 @mcp.tool(title="Get unified diff for a specific normalized file key")
 def get_file_diff(
     left_repo_path: str,
     right_repo_path: str,
     relative_path: str,
     context_lines: int = 4,
+    module_map_override: Optional[Dict[str, Optional[str]]] = None,
+    package_map_override: Optional[Dict[str, str]] = None,
+    use_cache: bool = True,
+    refresh_cache: bool = False,
 ) -> Dict[str, str]:
     left_root = _validate_repo_path(left_repo_path)
     right_root = _validate_repo_path(right_repo_path)
     norm_key = relative_path
+    module_map = MANUAL_MODULE_MAP if module_map_override is None else module_map_override
+    package_map = PACKAGE_MAP if package_map_override is None else package_map_override
 
     def find_actual(repo_root: str, key: str) -> Optional[str]:
-        all_files = _collect_java_files(repo_root)
+        all_files = _collect_java_files(repo_root, use_cache=use_cache, refresh_cache=refresh_cache)
         for orig_rel, abs_path in all_files.items():
-            if normalize_java_relpath(orig_rel) == key:
+            if normalize_java_relpath_with_maps(orig_rel, module_map, package_map) == key:
                 return abs_path
         return None
 
@@ -901,10 +1392,10 @@ def get_file_diff(
     if not right_file:
         raise ValueError(f"File not found in right repo for key: {norm_key}")
 
-    left = _read_file_text(left_file)
-    right = _read_file_text(right_file)
+    left = _read_file_text_cached(left_file, use_cache=use_cache)
+    right = _read_file_text_cached(right_file, use_cache=use_cache)
 
-    for lpkg, rpkg in PACKAGE_MAP.items():
+    for lpkg, rpkg in package_map.items():
         left = left.replace(f"package {lpkg}", f"package {rpkg}")
 
     diff_lines = difflib.unified_diff(
@@ -930,10 +1421,16 @@ def get_file_diff(
 def scan_quarkus_modules_vs_spring_projects(
     quarkus_repo_path: str,
     module_mappings: List[Dict[str, str]],
+    module_map_override: Optional[Dict[str, Optional[str]]] = None,
+    package_map_override: Optional[Dict[str, str]] = None,
+    use_cache: bool = True,
+    refresh_cache: bool = False,
 ) -> Dict[str, Any]:
     quarkus_root = _validate_repo_path(quarkus_repo_path)
 
     results = []
+    module_map = MANUAL_MODULE_MAP if module_map_override is None else module_map_override
+    package_map = PACKAGE_MAP if package_map_override is None else package_map_override
 
     for mapping in module_mappings:
         module_name = mapping.get("module")
@@ -958,11 +1455,21 @@ def scan_quarkus_modules_vs_spring_projects(
             })
             continue
 
-        left_files = _collect_java_files(quarkus_module_root)
-        right_files = _collect_java_files(spring_root)
+        left_files = _collect_java_files(
+            quarkus_module_root, use_cache=use_cache, refresh_cache=refresh_cache
+        )
+        right_files = _collect_java_files(
+            spring_root, use_cache=use_cache, refresh_cache=refresh_cache
+        )
 
-        left_norm = {normalize_java_relpath(rel): path for rel, path in left_files.items()}
-        right_norm = {normalize_java_relpath(rel): path for rel, path in right_files.items()}
+        left_norm = {
+            normalize_java_relpath_with_maps(rel, module_map, package_map): path
+            for rel, path in left_files.items()
+        }
+        right_norm = {
+            normalize_java_relpath_with_maps(rel, module_map, package_map): path
+            for rel, path in right_files.items()
+        }
 
         left_keys = set(left_norm.keys())
         right_keys = set(right_norm.keys())
@@ -975,10 +1482,17 @@ def scan_quarkus_modules_vs_spring_projects(
         identical = 0
 
         for key in common:
-            left_text = _read_file_text(left_norm[key])
-            right_text = _read_file_text(right_norm[key])
+            if not package_map:
+                left_hash = _file_hash(left_norm[key], use_cache=use_cache)
+                right_hash = _file_hash(right_norm[key], use_cache=use_cache)
+                if left_hash == right_hash:
+                    identical += 1
+                    continue
 
-            for lpkg, rpkg in PACKAGE_MAP.items():
+            left_text = _read_file_text_cached(left_norm[key], use_cache=use_cache)
+            right_text = _read_file_text_cached(right_norm[key], use_cache=use_cache)
+
+            for lpkg, rpkg in package_map.items():
                 left_text = left_text.replace(f"package {lpkg}", f"package {rpkg}")
 
             if left_text == right_text:
@@ -989,6 +1503,8 @@ def scan_quarkus_modules_vs_spring_projects(
         results.append({
             "module": module_name,
             "spring_repo_path": spring_root,
+            "module_map_used": module_map,
+            "package_map_used": package_map,
             "only_in_quarkus": only_left,
             "only_in_spring": only_right,
             "different_files": different,
@@ -1162,17 +1678,19 @@ def merge_changes_tool(
     source_repo_path: str,
     target_repo_path: str,
     source_commit: str,
-    mode: str = "preview",  # "preview" or "apply"
+    mode: str = "preview",  # "preview", "check", or "apply"
     allow_files: Optional[List[str]] = None,
     include_staged: bool = True,
     include_untracked: bool = False,
     context_lines: int = 3,
+    path_remap_rules: Optional[List[Dict[str, str]]] = None,
+    apply_check: bool = True,
 ) -> Dict[str, Any]:
     source_root = _validate_repo_path(source_repo_path)
     target_root = _validate_repo_path(target_repo_path)
 
-    if mode not in ("preview", "apply"):
-        raise ValueError("mode must be 'preview' or 'apply'")
+    if mode not in ("preview", "check", "apply"):
+        raise ValueError("mode must be 'preview', 'check', or 'apply'")
 
     changed_info = _collect_changed_files(
         source_root,
@@ -1185,9 +1703,11 @@ def merge_changes_tool(
 
     preview_items = []
     for rel in changed_files:
-        target_abs = os.path.join(target_root, rel)
+        target_rel = _apply_path_remap(rel, path_remap_rules)
+        target_abs = os.path.join(target_root, target_rel)
         preview_items.append({
-            "path": rel,
+            "source_path": rel,
+            "target_path": target_rel,
             "target_exists": os.path.isfile(target_abs),
         })
 
@@ -1198,13 +1718,14 @@ def merge_changes_tool(
             "source_commit": source_commit,
             "include_staged": include_staged,
             "include_untracked": include_untracked,
+            "path_remap_rules": path_remap_rules or [],
             "changed_files_count": len(changed_files),
             "changed_files": changed_files,
             "preview": preview_items,
         }
 
     if not allow_files:
-        raise ValueError("allow_files must be provided when mode='apply'")
+        raise ValueError("allow_files must be provided when mode='check' or mode='apply'")
 
     allow_set = set(_normalize_path(p) for p in allow_files)
     results = []
@@ -1212,12 +1733,14 @@ def merge_changes_tool(
     for rel in allow_set:
         if rel not in changed_files:
             results.append({
-                "path": rel,
+                "source_path": rel,
+                "target_path": _apply_path_remap(rel, path_remap_rules),
                 "status": "skipped",
                 "reason": "not in changed_files",
             })
             continue
 
+        target_rel = _apply_path_remap(rel, path_remap_rules)
         patch_parts = []
 
         # Untracked files: use no-index diff against /dev/null
@@ -1227,7 +1750,7 @@ def merge_changes_tool(
                 ["diff", "--no-prefix", "--binary", "--no-index", "--", "/dev/null", rel],
             )
             if patch:
-                patch_parts.append(patch)
+                patch_parts.append(_rewrite_patch_paths(patch, rel, target_rel))
 
         # Tracked files: diff against commit (unstaged)
         patch = _git_diff(
@@ -1235,7 +1758,7 @@ def merge_changes_tool(
             ["diff", "--no-prefix", "--binary", f"-U{context_lines}", source_commit, "--", rel],
         )
         if patch:
-            patch_parts.append(patch)
+            patch_parts.append(_rewrite_patch_paths(patch, rel, target_rel))
 
         # Staged changes
         if include_staged:
@@ -1244,20 +1767,71 @@ def merge_changes_tool(
                 ["diff", "--no-prefix", "--binary", f"-U{context_lines}", "--cached", source_commit, "--", rel],
             )
             if patch:
-                patch_parts.append(patch)
+                patch_parts.append(_rewrite_patch_paths(patch, rel, target_rel))
 
         patch_text = "".join(patch_parts)
         if not patch_text.strip():
             results.append({
-                "path": rel,
+                "source_path": rel,
+                "target_path": target_rel,
                 "status": "skipped",
                 "reason": "no diff for file",
             })
             continue
+        patch_meta = {
+            "patch_chars": len(patch_text),
+            "patch_lines": patch_text.count("\n") + 1,
+            "patch_stats": _patch_line_stats(patch_text),
+        }
 
-        target_abs = os.path.join(target_root, rel)
+        target_abs = os.path.join(target_root, target_rel)
         backup_path = None
-        if os.path.isfile(target_abs):
+
+        check_result = None
+        if mode == "check" or apply_check:
+            check_proc = subprocess.run(
+                ["git", "-C", target_root, "apply", "--check", "--binary", "--whitespace=nowarn"],
+                input=patch_text,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            check_result = {
+                "returncode": check_proc.returncode,
+                "stdout": (check_proc.stdout or "").strip(),
+                "stderr": (check_proc.stderr or "").strip(),
+            }
+            if mode == "check" and check_proc.returncode != 0:
+                results.append({
+                    "source_path": rel,
+                    "target_path": target_rel,
+                    "status": "check_failed",
+                    "error": check_result["stderr"],
+                    "backup": backup_path,
+                    "patch_meta": patch_meta,
+                })
+                continue
+            if mode == "check" and check_proc.returncode == 0:
+                results.append({
+                    "source_path": rel,
+                    "target_path": target_rel,
+                    "status": "check_ok",
+                    "backup": backup_path,
+                    "patch_meta": patch_meta,
+                })
+                continue
+            if apply_check and check_proc.returncode != 0:
+                results.append({
+                    "source_path": rel,
+                    "target_path": target_rel,
+                    "status": "check_failed",
+                    "error": check_result["stderr"],
+                    "backup": backup_path,
+                    "patch_meta": patch_meta,
+                })
+                continue
+
+        if mode == "apply" and os.path.isfile(target_abs):
             backup_path = target_abs + ".bak"
             os.makedirs(os.path.dirname(backup_path), exist_ok=True)
             shutil.copy2(target_abs, backup_path)
@@ -1274,15 +1848,20 @@ def merge_changes_tool(
             if backup_path and os.path.isfile(backup_path):
                 os.remove(backup_path)
             results.append({
-                "path": rel,
+                "source_path": rel,
+                "target_path": target_rel,
                 "status": "applied",
+                "patch_meta": patch_meta,
             })
         else:
             results.append({
-                "path": rel,
+                "source_path": rel,
+                "target_path": target_rel,
                 "status": "failed",
                 "error": (apply_proc.stderr or "").strip(),
                 "backup": backup_path,
+                "check": check_result,
+                "patch_meta": patch_meta,
             })
 
     return {
@@ -1292,6 +1871,8 @@ def merge_changes_tool(
         "include_staged": include_staged,
         "include_untracked": include_untracked,
         "mode": mode,
+        "path_remap_rules": path_remap_rules or [],
+        "apply_check": apply_check,
         "results": results,
     }
 
@@ -1319,6 +1900,42 @@ def clear_backup(
         "dry_run": dry_run,
         "count": len(removed),
         "files": removed,
+    }
+
+
+@mcp.tool(title="Restore .bak backups in a repo")
+def restore_backup(
+    repo_path: str,
+    dry_run: bool = True,
+    overwrite_existing: bool = False,
+) -> Dict[str, Any]:
+    root = _validate_repo_path(repo_path)
+    restored = []
+    skipped = []
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in (".git", "target", "build", ".idea", ".vscode", "out")]
+        for fname in filenames:
+            if not fname.endswith(".bak"):
+                continue
+            bak_path = os.path.join(dirpath, fname)
+            original_path = bak_path[:-4]
+            if os.path.exists(original_path) and not overwrite_existing:
+                skipped.append({"backup": bak_path, "reason": "original_exists"})
+                continue
+            restored.append({"backup": bak_path, "restored_to": original_path})
+            if not dry_run:
+                os.makedirs(os.path.dirname(original_path), exist_ok=True)
+                shutil.copy2(bak_path, original_path)
+
+    return {
+        "repo_root": root,
+        "dry_run": dry_run,
+        "overwrite_existing": overwrite_existing,
+        "restored": restored,
+        "skipped": skipped,
+        "restored_count": len(restored),
+        "skipped_count": len(skipped),
     }
 @mcp.tool(title="List changed files since a commit")
 def list_changed_files_since_commit(
